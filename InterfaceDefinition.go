@@ -13,12 +13,14 @@ const cgroupMountCpu = "/sys/fs/cgroup/cpu"
 const cgroupMountCpuset = "/sys/fs/cgroup/cpuset"
 const cgroupMountMemory = "/sys/fs/cgroup/memory"
 const cgroupMountBlkio = "/sys/fs/cgroup/blkio"
+const cgroupMountNetcls = "sys/fs/cgroup/net_cls"
 
 type processControl interface {
-    init();
-    limitRes();
-    changeRes();
-    deleteRes();
+    Init();
+    LimitRes();
+    ChangeRes();
+    DeleteRes();
+    AddPidsLimit();
 }
 
 type resourceLimit struct{
@@ -34,18 +36,16 @@ type resourceLimit struct{
 
     read_bps_device string;//IO 读速度限制
     write_bps_device string;//IO 写速度限制
-}
 
-type cgroupControl struct{
-}
-
-type tcControl struct{
-    PID string;         //进程PID
     bandwidth string; //进程使用网络带宽限制
 }
 
-/*对Linux下cgroup进行初始化*/
-func (cgroupcontrol cgroupControl) Init() {
+type resControl struct{
+
+}
+
+/*对Linux下cgroup和tc进行初始化*/
+func (rescontrol resControl) Init() {
     /*挂载cpu subsystem到/cgroup/cpu目录（hierarchy)*/
     cmd1 := exec.Command("mount","-t","cgroup","-o","cpu","cpu","/cgroup/cpu")
     cmd1.Stdin = os.Stdin
@@ -81,29 +81,31 @@ func (cgroupcontrol cgroupControl) Init() {
     if err := cmd4.Run(); err != nil {
         fmt.Println("ERROR", err)
         os.Exit(4)
-    }   
-}
-
-/*对Linux下tc进行初始化*/
-func (tccontrol tcControl) Init() {
-	/*在eth0上建立队列*/
-	cmd1 := exec.Command("tc","qdisc add dev eth0 root handle 1: cbq bandwidth 10Mbit avpkt 1000 cell 8 mpu 64")
-	if err := cmd1.Run(); err != nil {
+    }
+    /*挂载net_cls subsystem到/cgroup/net_cls目录（hierarchy)*/
+    cmd5 := exec.Command("mount","-t","cgroup","-o","net_cls","net_cls","/cgroup/net_cls")//挂载subsystem
+    cmd5.Stdin = os.Stdin
+    cmd5.Stdout = os.Stdout
+    cmd5.Stderr = os.Stderr
+    if err := cmd5.Run(); err != nil {
         fmt.Println("ERROR", err)
         os.Exit(5)
     }
-    
-    /*建立分类*/
-    cmd2 := exec.Command("tc","class add dev eth0 parent 1:0 classid 1:1 cbq bandwidth 10Mbit maxburst 20 allot 1514 prio 1 avpkt 1000 cell 8 weight 1Mbit")
-	if err := cmd2.Run(); err != nil {
+    /*对Linux下tc进行初始化*/
+
+    /*在eth0上创建添加队列规则qdisc,此处使用htb流量控制*/
+    cmd6 := exec.Command("tc","qdisc","add","dev","eth0","root","handle","1:htb")
+    cmd6.Stdin = os.Stdin
+    cmd6.Stdout = os.Stdout
+    cmd6.Stderr = os.Stderr
+    if err := cmd6.Run(); err != nil {
         fmt.Println("ERROR", err)
         os.Exit(6)
-    }
+    }   
 }
 
-func (cgroupcontrol cgroupControl) LimitRes(reslimit resourceLimit) int{
-    
-    /*Linux内核cgroup模块限制进程资源*/
+/*限制进程资源*/
+func (rescontrol resControl) LimitRes(reslimit resourceLimit) int{
 
     /*控制进程cpu资源*/
     if reslimit.cfs_quota_us != " " && reslimit.cfs_period_us != " " {
@@ -134,14 +136,31 @@ func (cgroupcontrol cgroupControl) LimitRes(reslimit resourceLimit) int{
         ioutil.WriteFile(path.Join(cgroupMountBlkio, "resourcelimit", "memory.read_bps_device") , []byte("reslimit.read_bps_device"), 0644)
         ioutil.WriteFile(path.Join(cgroupMountMemory, "resourcelimit", "memory.write_bps_device") , []byte("reslimit.write_bps_device"), 0644)
     }
-    return 0
-}
+    
+    /*配置cgourp模块控制进程带宽资源（同时需对tc模块进行配置）*/
+    if reslimit.bandwidth != " " {
+        os.Mkdir(path.Join(cgroupMountNetcls, "resourceLimit"), 0755)
+        ioutil.WriteFile(path.Join(cgroupMountNetcls, "resourcelimit", "net_cls.classid") , []byte("0x100001"), 0644)
 
-func (tccontrol tcControl) LimitRes() int{
+        /*在qdisc下建立分类，classid为1:1，与写入cgroup/net_cls.classid中一致*/
+        cmd1 := exec.Command("tc","class","add", "dev","eth0","parent","1:classid","1:1","htb","rate",resourcelimit.bandwidth)
+        cmd1.Stdin = os.Stdin
+        cmd1.Stdout = os.Stdout
+        cmd1.Stderr = os.Stderr
+        if err := cmd1.Run(); err != nil {
+            fmt.Println("ERROR", err)
+            os.Exit(7)
+        }
 
-    /*Linux内核tc模块控制带宽*/
-    if tccontrol.bandwidth != " " {
-        /*?如何根据进程号进行限速*/
+        /*添加cgroup过滤器*/
+        cmd2 := exec.Command("tc","filter","add","dev","eth0","parent","1:protocol","ip","prio","10","handle","1:","cgroup")
+        cmd2.Stdin = os.Stdin
+        cmd2.Stdout = os.Stdout
+        cmd2.Stderr = os.Stderr
+        if err := cmd2.Run(); err != nil {
+            fmt.Println("ERROR", err)
+            os.Exit(8)
+        }
     }
     return 0
 }
@@ -159,7 +178,7 @@ const (
 )
 
 /*对进程资源限制进行修改，传入要修改资源号的切片*/
-func (cgroupcontrol cgroupControl) ChangeRes(flags []int, reslimit resourceLimit) int{ 
+func (rescontrol resControl) ChangeRes(flags []int, reslimit resourceLimit) int{ 
     for i := 0; i < len(flags); i++ {   
         switch flags[i] {
             case CFS_QUOTA_US:
@@ -176,6 +195,15 @@ func (cgroupcontrol cgroupControl) ChangeRes(flags []int, reslimit resourceLimit
                 ioutil.WriteFile(path.Join(cgroupMountBlkio, "resourcelimit", "memory.read_bps_device") , []byte("reslimit.read_bps_device"), 0644)
             case WRITE_BPS_DEVICE:
                 ioutil.WriteFile(path.Join(cgroupMountMemory, "resourcelimit", "memory.write_bps_device") , []byte("reslimit.write_bps_device"), 0644)
+            case BANDWIDTH:
+                cmd := exec.Command("tc","class","change","dev","br0","parent","10:classid","1:1","htb","rate",resourcelimit.bandwidth)
+                cmd.Stdin = os.Stdin
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
+                if err := cmd.Run(); err != nil {
+                    fmt.Println("ERROR", err)
+                    os.Exit(9)
+                }
             default:
                 return -1
         }
@@ -184,34 +212,55 @@ func (cgroupcontrol cgroupControl) ChangeRes(flags []int, reslimit resourceLimit
 
 }
 
-/*对进程资源限制进行删除cgdelete*/
-func (cgroupcontrol cgroupControl) DeleteRes(flags []int) int{
+/*模块对进程资源限制进行删除cgdelete*/
+func (rescontrol resControl) DeleteRes(flags []int) int{
     for i := 0; i < len(flags); i++ {
         switch flags[i]{
             case CFS_QUOTA_US , CFS_PERIOD_US:
                 cmd := exec.Command("cgdelete","-r",cgroupMountCpu)
-                if err := cmd.Run(); err != nil {
-                    fmt.Println("ERROR", err)
-                    os.Exit(7)
-                }   
-            case CPUS , MEMS:
-                cmd := exec.Command("cgdelete","-r",cgroupMountCpuset)
-                if err := cmd.Run(); err != nil {
-                    fmt.Println("ERROR", err)
-                    os.Exit(8)
-                }
-            case LIMIT_IN_BYTES:
-                cmd := exec.Command("cgdelete","-r",cgroupMountMemory)
-                if err := cmd.Run(); err != nil {
-                    fmt.Println("ERROR", err)
-                    os.Exit(9)
-                }
-            case READ_BPS_DEVICE , WRITE_BPS_DEVICE:
-                cmd := exec.Command("cgdelete","-r",cgroupMountBlkio)
+                cmd.Stdin = os.Stdin
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
                 if err := cmd.Run(); err != nil {
                     fmt.Println("ERROR", err)
                     os.Exit(10)
+                }   
+            case CPUS , MEMS:
+                cmd := exec.Command("cgdelete","-r",cgroupMountCpuset)
+                cmd.Stdin = os.Stdin
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
+                if err := cmd.Run(); err != nil {
+                    fmt.Println("ERROR", err)
+                    os.Exit(11)
                 }
+            case LIMIT_IN_BYTES:
+                cmd := exec.Command("cgdelete","-r",cgroupMountMemory)
+                cmd.Stdin = os.Stdin
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
+                if err := cmd.Run(); err != nil {
+                    fmt.Println("ERROR", err)
+                    os.Exit(12)
+                }
+            case READ_BPS_DEVICE , WRITE_BPS_DEVICE:
+                cmd := exec.Command("cgdelete","-r",cgroupMountBlkio)
+                cmd.Stdin = os.Stdin
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
+                if err := cmd.Run(); err != nil {
+                    fmt.Println("ERROR", err)
+                    os.Exit(13)
+                }
+            case BANDWIDTH:
+                cmd := exec.Command("tc","qdisc","del","dev","eth0","root","handle","1:htb")
+                cmd.Stdin = os.Stdin
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
+                if err := cmd.Run(); err != nil {
+                    fmt.Println("ERROR", err)
+                    os.Exit(14)
+                }   
             default:
                 return -1
         }
@@ -225,7 +274,7 @@ type processResourceAlloc struct{
 }
 
 /*已配置好资源组，让服务按组资源进行分配cgexec，传入进程结构体切片*/
-func (cgroupcontrol cgroupControl) AddPidsLimit (PRA []processResourceAlloc) int{
+func (rescontrol resControl) AddPidsLimit (PRA []processResourceAlloc) int{
     for i := 0; i < len(PRA); i++ {
         for j := 0; j < len(PRA[i].RES); j++ {
             switch PRA[i].RES[j]{
@@ -236,7 +285,7 @@ func (cgroupcontrol cgroupControl) AddPidsLimit (PRA []processResourceAlloc) int
                     cmd.Stderr = os.Stderr
                     if err := cmd.Run(); err != nil {
                         fmt.Println("ERROR", err)
-                        os.Exit(11)
+                        os.Exit(15)
                     }   
                 case CPUS , MEMS:
                     cmd := exec.Command("echo",PRA[i].PID,">",path.Join(cgroupMountCpuset, "resourcelimit", "tasks"))
@@ -245,7 +294,7 @@ func (cgroupcontrol cgroupControl) AddPidsLimit (PRA []processResourceAlloc) int
                     cmd.Stderr = os.Stderr
                     if err := cmd.Run(); err != nil {
                         fmt.Println("ERROR", err)
-                        os.Exit(12)
+                        os.Exit(16)
                     }
                 case LIMIT_IN_BYTES:
                     cmd := exec.Command("echo",PRA[i].PID,">",path.Join(cgroupMountMemory, "resourcelimit", "tasks"))
@@ -254,7 +303,7 @@ func (cgroupcontrol cgroupControl) AddPidsLimit (PRA []processResourceAlloc) int
                     cmd.Stderr = os.Stderr
                     if err := cmd.Run(); err != nil {
                         fmt.Println("ERROR", err)
-                        os.Exit(13)
+                        os.Exit(17)
                     }
                 case READ_BPS_DEVICE , WRITE_BPS_DEVICE:
                     cmd := exec.Command("echo",PRA[i].PID,">",path.Join(cgroupMountBlkio, "resourcelimit", "tasks"))
@@ -263,8 +312,10 @@ func (cgroupcontrol cgroupControl) AddPidsLimit (PRA []processResourceAlloc) int
                     cmd.Stderr = os.Stderr
                     if err := cmd.Run(); err != nil {
                         fmt.Println("ERROR", err)
-                        os.Exit(14)
+                        os.Exit(18)
                     }
+                case BANDWIDTH:
+                    /*net_cls通过给packet添加classid进行流控，怎么给进程packet添加sock里的classid？*/
                 default:
                     return -1
             }
