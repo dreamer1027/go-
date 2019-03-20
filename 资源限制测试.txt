@@ -1,0 +1,18 @@
+1.对IO限制进行测试
+消耗IO命令行：dd if=/dev/sda of=/dev/null  使用iotop工具进行查看。
+
+2.对内存限制进行测试
+消耗内存的mysql脚本文件：
+x='a'  
+while [ True ];do  
+    x=$x$x  
+done; 
+使用top工具进行查看。（跑消耗内存的脚本文件命令窗口直接关闭）
+
+3.对CPU限制进行测试
+运用mysqlslap性能测试工具对已安装的mysql进行压力测试
+mysqlslap?--concurrency（并发数量）=150?--iterations（测试次数）=1?--number-int-cols（创建测试表的int型字段数量）=8?
+--auto-generate-sql（用系统生成SQL脚本进行测试）?--auto-generate-sql-load-type（读写混合）=mixed?--engine=innodb?--number-of-queries=100000?
+-ujesse?-pjesse?--number-char-cols=35?--auto-generate-sql-add-autoincrement?--debug-info?-P3306?-h127.0.0.1
+4.对进程带宽限制进行测试
+用iperf指令进行打流，运用cgroup和tc进行流控。
